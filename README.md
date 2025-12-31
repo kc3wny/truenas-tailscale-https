@@ -29,4 +29,4 @@ To automate this task, we will use a cron job. Go to System > Advanced Settings 
 - Schedule: (0 0 1 * *) (note: this can be at any interval, but given Tailscale certs are only valid for 90 days, a monthly refresh is advisable)
 - Enabled: Yes
 
-You should manually run this in the WebUI, if you have email alerts configured you will recieve an error output if the script fails to run. Another way to check is to note the time on tailscale certificate name (last set of numbers), if it matches when you started the cron job that means it ran successfully.
+You should manually run this in the WebUI, if you have email alerts configured you will recieve an error output if the script fails to run. Another way to check is to note the time on the tailscale certificate name (last set of numbers), if it matches when you started the cron job that means it ran successfully.
