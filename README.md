@@ -13,6 +13,8 @@ Copy the script to your home directory through SSH or the WebUI console interfac
 wget https://raw.githubusercontent.com/kc3wny/truenas-tailscale-https/refs/heads/main/renew_tailscale_cert.sh && chmod +x renew_tailscale_cert.sh
 ```
 
+Edit this script to include your `machine-name.tailnet-name.ts.net` address so the correct certificate can be provisoned
+
 Test the script using the command below before moving on:
 
 ```
