@@ -9,87 +9,74 @@ TS_DOMAIN="machine-name.tailnet-name.ts.net"
 CONTAINER_NAME=$(docker ps --format '{{.Names}}' | grep -i tailscale | head -n 1)
 CERT_NAME="Tailscale-Auto-$(date +%Y%m%d-%H%M%S)"
 
-# tailscale app container check
 if [ -z "$CONTAINER_NAME" ]; then
     echo "Error: Tailscale container not found. (Docker Socket check: $(ls -l /var/run/docker.sock))"
     exit 1
 fi
-
 echo "Found Tailscale container: $CONTAINER_NAME"
 
-# generate tailscale tls cert
 echo "Generating certificate for $TS_DOMAIN..."
 docker exec "$CONTAINER_NAME" tailscale cert "$TS_DOMAIN"
-
-# copy cert files to temp files
 docker exec "$CONTAINER_NAME" cat "$TS_DOMAIN.crt" > /tmp/ts_cert.crt
 docker exec "$CONTAINER_NAME" cat "$TS_DOMAIN.key" > /tmp/ts_key.key
 
-# verify certs not empty
 if [ ! -s /tmp/ts_cert.crt ] || [ ! -s /tmp/ts_key.key ]; then
     echo "Error: Failed to retrieve certificate files."
     rm -f /tmp/ts_cert.crt /tmp/ts_key.key
     exit 1
 fi
 
-# import certs to TrueNAS
-echo "Importing certificate '$CERT_NAME' into TrueNAS..."
+CERT_NAME="$CERT_NAME" TS_DOMAIN="$TS_DOMAIN" python3 <<'EOF'
+import os
+import sys
+import time
+from truenas_api_client import Client
 
-PAYLOAD=$(python3 -c "import json; print(json.dumps({
-    'name': '$CERT_NAME',
-    'certificate': open('/tmp/ts_cert.crt').read(),
-    'privatekey': open('/tmp/ts_key.key').read(),
-    'create_type': 'CERTIFICATE_CREATE_IMPORTED'
-}))")
+cert_name = os.environ["CERT_NAME"]
+ts_domain = os.environ["TS_DOMAIN"]
 
-midclt call certificate.create "$PAYLOAD" > /dev/null 2>&1
+try:
+    with Client() as c:
+        print(f"Importing certificate '{cert_name}' into TrueNAS...")
+        cert = c.call('certificate.create', {
+            'name': cert_name,
+            'certificate': open('/tmp/ts_cert.crt').read(),
+            'privatekey': open('/tmp/ts_key.key').read(),
+            'create_type': 'CERTIFICATE_CREATE_IMPORTED',
+        }, job=True)
+        cert_id = cert['id']
+        print(f"Certificate imported successfully. ID: {cert_id}")
 
-# cleanup temp files
+        print("Waiting 5 seconds")
+        time.sleep(5)
+
+        print(f"Activating new certificate for WebUI (ID: {cert_id})...")
+        c.call('system.general.update', {'ui_certificate': cert_id})
+        print("WebUI settings updated successfully.")
+
+        print("Restarting WebUI service...")
+        c.call('service.reload', 'http')
+
+        current_id = c.call('system.general.config')['ui_certificate']['id']
+        if current_id != cert_id:
+            print(f"Warning: System is reporting Active ID {current_id}, "
+                  f"but we just installed {cert_id}. Skipping cleanup.")
+            sys.exit(0)
+
+        print("Cleaning up old certificates...")
+        for old in c.call('certificate.query'):
+            if old['name'].startswith('Tailscale-Auto-') and old['id'] != current_id:
+                print(f"Deleting old certificate ID: {old['id']}")
+                c.call('certificate.delete', old['id'])
+
+        print(f"Success! WebUI updated to use {ts_domain}")
+
+except Exception as e:
+    print(f"CRITICAL ERROR: {e}")
+    sys.exit(1)
+EOF
+PYTHON_EXIT=$?
+
 rm -f /tmp/ts_cert.crt /tmp/ts_key.key
 
-# retrieve cert ID
-CERT_ID=$(midclt call certificate.query | jq -r ".[] | select(.name == \"$CERT_NAME\") | .id")
-
-if ! [[ "$CERT_ID" =~ ^[0-9]+$ ]]; then
-    echo "CRITICAL ERROR: Failed to find imported certificate ID for name $CERT_NAME"
-    exit 1
-fi
-
-echo "Certificate imported successfully. ID: $CERT_ID"
-
-# wait for sync
-echo "Waiting 5 seconds"
-sleep 5
-
-# provision cert to WebUI
-echo "Activating new certificate for WebUI (ID: $CERT_ID)..."
-
-UPDATE_STATUS=$(midclt call system.general.update "{\"ui_certificate\": $CERT_ID}" 2>&1)
-
-if [[ "$UPDATE_STATUS" == *"[E"* ]] || [[ "$UPDATE_STATUS" == *"Error"* ]]; then
-    echo "CRITICAL ERROR: Activation failed. Stopping to prevent deletion."
-    echo "Error details: $UPDATE_STATUS"
-    exit 1
-fi
-
-echo "WebUI settings updated successfully."
-
-# reload WebUI
-echo "Restarting WebUI service..."
-midclt call service.reload http
-
-# clean old certificates
-echo "Cleaning up old certificates..."
-CURRENT_CERT_ID=$(midclt call system.general.config | jq -r '.ui_certificate.id')
-
-if [ "$CURRENT_CERT_ID" != "$CERT_ID" ]; then
-    echo "Warning: System is reporting Active ID $CURRENT_CERT_ID, but we just installed $CERT_ID. Skipping cleanup."
-    exit 0
-fi
-
-midclt call certificate.query | jq -r ".[] | select(.name | startswith(\"Tailscale-Auto-\")) | select(.id != $CURRENT_CERT_ID) | .id" | while read -r OLD_ID; do
-    echo "Deleting old certificate ID: $OLD_ID"
-    midclt call certificate.delete "$OLD_ID"
-done
-
-echo "Success! WebUI updated to use $TS_DOMAIN"
+exit $PYTHON_EXIT
